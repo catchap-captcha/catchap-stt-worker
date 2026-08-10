@@ -8,12 +8,16 @@ name: 이미지 만들고 배포 태그 갱신
 #
 # ★태그는 반드시 ★커밋 해시입니다. latest 를 쓰면 무엇이 떠 있는지 알 수 없어집니다.
 #
-# ⚠️★이 저장소만 다른 점 — 이미지가 ★6.6GB 입니다 (CUDA 12.2 + cuDNN8 베이스가 대부분)
+# ⚠️★이 저장소만 다른 점 — 이미지가 ★약 9.5GB 입니다
+#    (CUDA 12.2 + cuDNN8 베이스 약 6.6GB + ★이미지에 구운 모델 3.09GB)
 #     ① ★캐시를 안 씁니다. 다른 저장소는 cache-to: type=gha,mode=max 를 쓰는데,
 #        GitHub Actions 캐시는 저장소당 ★10GB 한도라 이 이미지 하나로 꽉 찹니다.
 #        그러면 ★다른 저장소의 캐시까지 밀려 나갑니다. 안 쓰는 편이 낫습니다.
 #     ② ★러너 디스크를 먼저 비웁니다. 기본 상태로는 빠듯합니다.
-#     ③ timeout 이 30분이 아니라 ★45분입니다.
+#     ③ timeout 이 30분이 아니라 ★90분입니다.
+#        ⚠️45분으로 뒀다가 ★실제로 걸려서 취소됐습니다(0810).
+#          모델을 이미지에 구우면서 6.6GB → 9.5GB 가 됐고, 굽고 올리는 데
+#          45분을 넘겼습니다. 넉넉히 두 배로 올렸습니다.
 #
 # ⬜필요한 Secret 3개 (저장소 Settings → Secrets and variables → Actions)
 #     REGISTRY_USERNAME        Container Registry 용 ★IAM 액세스 키 ID
@@ -43,7 +47,7 @@ jobs:
   build-and-update:
     name: 이미지 → 레지스트리 → 매니페스트 태그
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 90
     steps:
       - name: 코드 받기
         uses: actions/checkout@v5
@@ -82,7 +86,7 @@ jobs:
           echo "ready=true" >> "$GITHUB_OUTPUT"
           echo "Secret 3개 확인"
 
-      - name: 러너 디스크 비우기 (이미지가 6.6GB 입니다)
+      - name: 러너 디스크 비우기 (이미지가 약 9.5GB 입니다)
         if: steps.gate.outputs.ready == 'true'
         run: |
           echo "── 비우기 전"; df -h / | tail -1

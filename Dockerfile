@@ -13,10 +13,11 @@ RUN apt-get update \
 WORKDIR /app
 COPY requirements.txt .
 RUN pip3 install --no-cache-dir -r requirements.txt
-# ★secrets_loader.py 를 같이 넣는다 — main.py 가 이것을 부른다.
-#   빠뜨리면 import 부터 실패해서 파드가 아예 안 뜬다(조용히 지나가지는 않는다).
-COPY main.py secrets_loader.py ./
 
+# ★★층 순서가 중요하다 — ★모델을 ★코드보다 ★먼저 넣는다.
+#   도커는 위에서부터 층을 쌓고, 바뀐 층부터 아래를 다시 만든다.
+#   코드(main.py)를 위에 두면 ★한 줄만 고쳐도 3GB 모델을 다시 받고 다시 올린다.
+#   모델은 거의 안 바뀌므로 위에, 코드는 아래에 둔다.
 # ★★모델(3.09GB)을 ★이미지에 굽는다 — 2026-08-10 결정
 #
 # ★왜 — 전에는 쿠버네티스 PVC(디스크)에 캐시로 두었다. 그런데 그 디스크는
@@ -50,6 +51,11 @@ snapshot_download('${STT_MODEL_REPO}', revision='${STT_MODEL_REVISION}', local_d
     && test -s /opt/whisper-model/vocabulary.json
 # ★위 test 4줄이 있는 이유 — 일부만 받아져도 빌드는 성공해 버린다. 그러면 파드는
 #   멀쩡히 뜨고 ★첫 전사에서야 죽는다. 빌드에서 시끄럽게 실패하는 편이 낫다.
+
+# ★secrets_loader.py 를 같이 넣는다 — main.py 가 이것을 부른다.
+#   빠뜨리면 import 부터 실패해서 파드가 아예 안 뜬다(조용히 지나가지는 않는다).
+COPY main.py secrets_loader.py ./
+
 
 # 기본값 — GPU(T4) 기준. 호스트에서 -e로 덮어쓴다(예: 모델 크기·토큰).
 # ★STT_MODEL 이 ★경로다. faster-whisper 는 이름 대신 로컬 경로를 받으면
