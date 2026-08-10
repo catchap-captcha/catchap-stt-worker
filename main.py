@@ -92,7 +92,7 @@ def health() -> dict:
 
 
 @app.post("/transcribe")
-async def transcribe(
+def transcribe(
     file: UploadFile = File(...),
     language: str = "ko",
     x_worker_token: str = Header(default=""),
@@ -100,14 +100,35 @@ async def transcribe(
     """영상/오디오 → 전사 세그먼트 [{start, end, text}] (초 단위·시간순).
 
     stt_client.transcribe_video(OpenAI)와 동일한 반환 형태 — 백엔드가 소스에 상관없이 같은
-    코드로 처리한다. 세그먼트가 하나도 없으면(무음 등) 422 — 빈 자막을 성공으로 위장하지 않는다."""
+    코드로 처리한다. 세그먼트가 하나도 없으면(무음 등) 422 — 빈 자막을 성공으로 위장하지 않는다.
+
+    ★★`async def` 가 아니라 ★`def` 다. 이 한 글자가 장애를 냈다 (2026-08-10 실제로 겪음).
+
+      faster-whisper 의 transcribe 는 ★블로킹(동기) 호출이다. 그것을 `async def` 안에서
+      부르면 ★이벤트 루프가 통째로 멈춘다. uvicorn 은 워커 한 벌·루프 한 개라,
+      전사가 도는 동안 ★/health 가 응답을 못 한다.
+
+      쿠버네티스의 살아있음 검사는 30초마다 물어 3번 실패하면 컨테이너를 죽인다.
+      즉 ★90초가 넘는 전사는 ★반드시 죽는다. 강의 하나를 실제로 올렸더니
+      exitCode 137 로 죽고 강사님께 실패 메일이 갔다.
+
+      ⚠️★옛 GPU VM 에서는 이 문제가 없었다 — `docker run` 이라 살아있음 검사가 없었다.
+        쿠버네티스로 들어오면서 생긴 것이고, ★내 시험이 16~40초짜리라 90초를 못 넘겨
+        안 드러났다. 「짧은 표본으로 통과했다」가 「된다」가 아니다.
+
+      ★`def` 로 두면 FastAPI 가 ★별도 스레드에서 돌린다. 이벤트 루프가 살아 있어
+      전사 중에도 /health 가 대답한다. 그래서 안 죽는다.
+      ⚠️그래서 `await file.read()` 대신 ★`file.file.read()` 를 쓴다(동기 함수라서).
+
+      ★이 성질은 CI 가 실제로 확인한다 — 느린 전사를 흉내 내면서 /health 를 두드린다.
+    """
     if _TOKEN and x_worker_token != _TOKEN:
         raise HTTPException(status_code=401, detail="invalid worker token")
 
     suffix = os.path.splitext(file.filename or "")[1] or ".mp4"
     # 임시 파일로 받아 전사(faster-whisper는 파일 경로를 받는다 — mp4/webm 컨테이너 그대로 OK).
     with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
-        tmp.write(await file.read())
+        tmp.write(file.file.read())     # ★동기 읽기 (이 함수가 def 라서)
         path = tmp.name
     try:
         segments, info = _get_model().transcribe(path, language=language, vad_filter=True)
