@@ -39,8 +39,34 @@ load_secrets_into_env()
 _MODEL_SIZE = os.environ.get("STT_MODEL", "large-v3")
 _DEVICE = os.environ.get("STT_DEVICE", "cuda")
 _COMPUTE = os.environ.get("STT_COMPUTE", "float16")
-# 백엔드만 부르게 하는 공유 토큰(빈 값이면 인증 생략 — 로컬/사내망 전용 기동 시).
+# 백엔드만 부르게 하는 공유 토큰. ★빈 값이면 아래 transcribe 가 인증을 통째로 건너뛴다.
 _TOKEN = os.environ.get("STT_WORKER_TOKEN", "")
+
+# ★★빈 토큰이면 ★기동에서 죽는다 — 0810 에 실제로 당한 것을 막는 빗장이다.
+#
+#   무슨 일이 있었나 — ConfigMap 에서 SECRETS_BACKEND 가 빠진 채 배포됐다.
+#   그러면 금고 로더는 "끈 것"으로 보고 조용히 지나가고, STT_WORKER_TOKEN 이 안 들어와
+#   _TOKEN 이 빈 문자열이 된다. 그런데 빈 값이면 인증을 ★건너뛴다.
+#   ★막히는 게 아니라 ★열린다. 파드는 멀쩡히 Running 이고 /health 도 200 이라
+#   기동 로그·감시로는 아무것도 안 보였다. 손으로 찔러 보고서야 알았다.
+#
+#   ⚠️로더의 SECRETS_REQUIRED_VARS 검사는 이걸 못 잡는다 —
+#     그 검사는 SECRETS_BACKEND=kakaocloud 로 로더가 ★실제로 돌 때만 걸린다.
+#     BACKEND 자체가 없으면 로더는 아무 일도 안 하고 통과한다.
+#
+#   ★그래서 앱 쪽에도 빗장을 건다. 「조용히 열린 채로 도는 것」보다
+#     ★시끄럽게 죽는 편이 낫다.
+#
+# ★로컬에서 토큰 없이 띄우려면 일부러 켜야 한다 — 실수로는 못 켠다.
+#     STT_ALLOW_NO_AUTH=true
+_ALLOW_NO_AUTH = os.environ.get("STT_ALLOW_NO_AUTH", "").strip().lower() in ("1", "true", "yes")
+if not _TOKEN and not _ALLOW_NO_AUTH:
+    raise RuntimeError(
+        "STT_WORKER_TOKEN 이 비어 있습니다 — 이대로 뜨면 ★인증 없이 누구나 이 워커를 씁니다.\n"
+        "  · 클러스터라면: ConfigMap 의 SECRETS_BACKEND/SECRETS_NAMES/SECRETS_REQUIRED_VARS 와\n"
+        "    Secret 의 SECRETS_ACCESS_KEY/SECRETS_SECRET_KEY 가 다 있는지 보십시오.\n"
+        "  · 일부러 인증 없이 띄우려면 STT_ALLOW_NO_AUTH=true 를 주십시오(로컬 전용)."
+    )
 
 app = FastAPI(title="CatChap STT Worker (faster-whisper)")
 
