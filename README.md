@@ -81,9 +81,21 @@ curl -s localhost:8100/health
 | `STT_COMPUTE` | `float16` | CPU 면 `int8` |
 | `STT_WORKER_TOKEN` | (빈 값) | ★백엔드와 나눠 갖는 열쇠. **빈 값이면 인증을 안 한다** |
 
-⚠️`STT_WORKER_TOKEN` 이 비면 **누구나 이 워커를 쓸 수 있다.** 클러스터에서는
-`stt-worker-secret` 이라는 K8s Secret 으로 넣는다. 값은 금고(Secrets Manager)의
-`catchap-stt-worker-token` 과 **같은 값**이어야 한다 — 백엔드가 그것을 읽어 보내기 때문이다.
+⚠️`STT_WORKER_TOKEN` 이 비면 **누구나 이 워커를 쓸 수 있다.** 막히는 게 아니라 **열린다.**
+
+★클러스터에서는 이 값을 **금고(Secrets Manager)에서 직접 읽는다.** `catchap-stt-worker-token`
+하나뿐이고, 백엔드도 **같은 시크릿**을 읽어 헤더에 실어 보낸다. 그래서 회전할 때
+**한 곳만 바꾸면 양쪽이 같이 따라온다.**
+
+```
+K8s Secret  stt-worker-secret   ★금고를 여는 열쇠 두 줄만
+                                SECRETS_ACCESS_KEY · SECRETS_SECRET_KEY
+금고        catchap-stt-worker-token   ★실제 값은 여기에만
+```
+
+⚠️★`secrets_loader.py` 호출은 `main.py` 의 `_TOKEN` 줄보다 **앞이어야 한다.**
+뒤로 밀리면 `_TOKEN` 이 빈 값으로 굳고 인증이 통째로 꺼진다. CI 가 이 순서를
+실제로 확인한다(가짜 로더를 끼워 `_TOKEN` 이 그 값을 받는지 본다).
 
 ## 보안
 - 워커는 **백엔드에서만** 접근한다. Service 가 ClusterIP 라 클러스터 밖에서는 안 보이고,

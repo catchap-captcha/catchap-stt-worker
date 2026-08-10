@@ -13,7 +13,9 @@ RUN apt-get update \
 WORKDIR /app
 COPY requirements.txt .
 RUN pip3 install --no-cache-dir -r requirements.txt
-COPY main.py .
+# ★secrets_loader.py 를 같이 넣는다 — main.py 가 이것을 부른다.
+#   빠뜨리면 import 부터 실패해서 파드가 아예 안 뜬다(조용히 지나가지는 않는다).
+COPY main.py secrets_loader.py ./
 
 # 기본값 — GPU(T4) 기준. 호스트에서 -e로 덮어쓴다(예: 모델 크기·토큰).
 ENV STT_MODEL=large-v3 \
