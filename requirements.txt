@@ -1,0 +1,6 @@
+# STT 워커 의존성 — faster-whisper(CTranslate2 기반 Whisper 추론)는 CUDA 런타임 wheel을
+# 내장해 nvcc(CUDA 툴킷) 없이도 GPU 추론이 된다(드라이버만 있으면 됨).
+faster-whisper==1.2.1
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+python-multipart==0.0.20

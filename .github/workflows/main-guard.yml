@@ -1,0 +1,126 @@
+name: main 직접 push 감시
+
+# ★왜 있나 — 우리 조직은 Free 플랜이고 저장소가 비공개라 브랜치 보호가
+#   강제되지 않는다("won't be enforced on this private repository").
+#   그래서 main 직접 push 를 ★막을 수는 없다. 대신 ★즉시 드러나게 한다.
+#
+#   PR 을 거치지 않은 커밋이 main 에 들어오면 이 작업이 빨간불이 되고,
+#   GitHub 이 push 한 사람에게 메일을 보낸다.
+#
+# ⚠️이 작업이 빨간불이어도 코드가 되돌려지지는 않는다. 사람이 보고 판단한다.
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  guard:
+    name: PR 을 거쳤는지 확인
+    # ★저장소를 처음 만들 때의 첫 커밋은 넘어간다.
+    #   그때는 main 브랜치 ★자체가 없어서 PR 을 만들 방법이 없다.
+    #   github.event.created 는 「이 push 가 브랜치를 새로 만들었다」는 뜻이다.
+    #   ⚠️main 을 지웠다가 다시 만드는 경우도 여기에 걸린다. 그건 그 자체가
+    #     사람이 보고 판단해야 하는 일이라 감시 대상으로 삼지 않는다.
+    if: ${{ !github.event.created }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: 이 커밋이 PR 에서 왔나
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+          ACTOR: ${{ github.actor }}
+          # ★checkout 을 안 하므로 git 로 제목을 못 읽는다. 이벤트에서 받는다.
+          SUBJ: ${{ github.event.head_commit.message }}
+        run: |
+          set -uo pipefail
+
+          # 봇이 올린 것은 넘어간다 (CI 가 이미지 태그를 고치는 경우 등)
+          case "$ACTOR" in
+            *"[bot]"|github-actions|dependabot)
+              echo "::notice::봇($ACTOR)이 올린 커밋이라 넘어갑니다."
+              exit 0 ;;
+          esac
+
+          # ★★2026-08-07 실측 — 한 번만 물으면 ★오탐이 난다.
+          #
+          #   PR 을 병합한 직후에는 GitHub 이 "커밋↔PR" 연결을 ★아직 안 만들어 뒀다.
+          #   그 사이에 물으면 ★빈 목록이 온다. 그런데 ★정말 직접 push 한 경우도
+          #   똑같이 빈 목록이다. ★둘이 구분되지 않는다.
+          #
+          #   실제로 catchap-behavior-ai PR #1 병합에서 이 오탐이 났다.
+          #     3초 뒤 물음  → 빈 목록 → ❌ (오탐)
+          #     같은 커밋을 나중에 다시 물음 → PR #1 → ✅
+          #   ★코드도 설정도 그대로인데 답이 달라졌다. 시간 문제였다.
+          #
+          #   구분하는 방법은 ★기다렸다 다시 묻는 것뿐이다.
+          #   그래서 최대 6번(약 50초) 묻고, ★전부 빈 목록일 때만 위반으로 판정한다.
+          #
+          # ⬜커밋 제목 끝의 "(#12)" 로 판정하는 방법도 있지만 ★쓰지 않는다 —
+          #   손으로 적어도 통과해 버려서, 감시 장치를 스스로 무력화한다.
+          for TRY in 1 2 3 4 5 6; do
+            if ! OUT=$(gh api "repos/$REPO/commits/$SHA/pulls" \
+                         -H "Accept: application/vnd.github+json" 2>&1); then
+              echo "::warning::PR 조회에 실패했습니다. 판정하지 않고 넘어갑니다."
+              echo "$OUT" | head -3
+              exit 0        # ★측정 실패를 위반으로 읽지 않는다
+            fi
+
+            # ★응답이 JSON 이 아닐 수도 있다. 그때는 판정하지 않는다 —
+            #   ★측정 실패를 위반으로 읽으면 엉뚱한 사람을 잡는다.
+            COUNT=$(printf '%s' "$OUT" | python3 -c 'import json,sys; print(len(json.load(sys.stdin)))' 2>/dev/null || true)
+            case "$COUNT" in
+              ''|*[!0-9]*)
+                echo "::warning::PR 조회 응답을 읽지 못했습니다. 판정하지 않고 넘어갑니다."
+                printf '%s' "$OUT" | head -3
+                exit 0 ;;
+            esac
+
+            if [ "$COUNT" -gt 0 ]; then
+              NUM=$(printf '%s' "$OUT" | python3 -c 'import json,sys; print(json.load(sys.stdin)[0]["number"])')
+              echo "✅ PR #$NUM 을 거쳐 들어왔습니다. ($TRY 번째 조회에서 확인)"
+              exit 0
+            fi
+
+            if [ "$TRY" -lt 6 ]; then
+              echo "아직 PR 연결이 안 보입니다. 10초 기다렸다 다시 묻습니다. ($TRY/6)"
+              sleep 10
+            fi
+          done
+
+          # ★여기까지 왔으면 약 50초 동안 6번 물어도 계속 빈 목록이었다는 뜻이다.
+          SUBJ=$(printf '%s' "$SUBJ" | head -1)
+          cat <<MSG
+          ────────────────────────────────────────────────────────────
+          ⚠️ main 에 ★직접 push 되었습니다 — PR 을 거치지 않았습니다.
+
+            저장소   $REPO
+            커밋     $SHA
+            제목     $SUBJ
+            올린 사람 $ACTOR
+
+          ★약 50초 동안 6번 확인했습니다. 병합 직후의 일시적인 지연은 아닙니다.
+
+          ★막지는 못했습니다. 우리 조직은 Free 플랜 + 비공개 저장소라
+            브랜치 보호가 강제되지 않습니다. 그래서 이렇게 알립니다.
+
+          앞으로는 이렇게 해 주세요.
+
+            git switch -c fix/<요약>
+            git push -u origin HEAD
+            gh pr create --fill
+            gh pr checks --watch
+            gh pr merge --squash
+
+          ⬜이미 올린 것을 되돌리려면
+            git revert $SHA        (squash 라 커밋 하나만 되돌리면 됩니다)
+
+          ★급해서 그러셨다면 그대로 두셔도 됩니다. 다만 이 기록은 남습니다.
+          ────────────────────────────────────────────────────────────
+          MSG
+          exit 1

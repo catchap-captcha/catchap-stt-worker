@@ -1,0 +1,69 @@
+name: CI
+
+# ★이 저장소에는 시험이 없다 — 그래서 「없는 시험을 돌리는 척」하지 않는다.
+#   대신 ★GPU 없이도 확인할 수 있는 것만 실제로 확인한다.
+#
+#   ★확인되는 것
+#     · main.py 가 문법 오류 없이 import 되나
+#     · /health 가 200 을 주나
+#     · 토큰이 틀리면 /transcribe 가 ★401 을 주나 (인증이 살아 있나)
+#
+#   ★확인되지 ★않는 것 (숨기지 않고 적어 둔다)
+#     · 진짜 전사가 되는지는 ★GPU 가 있어야 안다. 여기서는 못 본다.
+#       → 배포한 뒤 클러스터에서 실제 파일로 확인한다.
+#
+# ★faster-whisper 를 안 깐다 — 6GB 가 넘고 CUDA 를 끌고 온다.
+#   main.py 가 faster_whisper 를 ★함수 안에서 import 하도록 짜여 있어서
+#   HTTP 계층만 따로 시험할 수 있다. 그 설계 덕분에 이 CI 가 10초에 끝난다.
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: HTTP 계층 의존성만 설치
+        run: |
+          python -m pip install --upgrade pip
+          # ★requirements.txt 를 안 쓴다 — faster-whisper 는 GPU 용이라 여기서 필요 없다
+          pip install fastapi==0.115.6 python-multipart==0.0.20 httpx
+
+      - name: HTTP 계층 확인
+        env:
+          STT_WORKER_TOKEN: ci-test-token
+          PYTHONIOENCODING: utf-8
+        run: |
+          python - <<'PY'
+          from fastapi.testclient import TestClient
+          import main
+
+          c = TestClient(main.app)
+
+          r = c.get("/health")
+          assert r.status_code == 200, r.status_code
+          b = r.json()
+          assert b["ok"] is True and b["loaded"] is False, b
+          print("  /health        200", b)
+
+          # ★토큰이 틀리면 막혀야 한다 — 이게 뚫리면 누구나 GPU 를 쓸 수 있다
+          r = c.post("/transcribe", files={"file": ("a.mp4", b"x", "video/mp4")},
+                     headers={"X-Worker-Token": "wrong"})
+          assert r.status_code == 401, (r.status_code, r.text[:200])
+          print("  /transcribe    401 (토큰 불일치)")
+
+          # ★헤더가 아예 없어도 막혀야 한다
+          r = c.post("/transcribe", files={"file": ("a.mp4", b"x", "video/mp4")})
+          assert r.status_code == 401, (r.status_code, r.text[:200])
+          print("  /transcribe    401 (헤더 없음)")
+          PY
