@@ -79,9 +79,15 @@ curl -s localhost:8100/health
 | `STT_MODEL` | `large-v3` | 모델 크기 |
 | `STT_DEVICE` | `cuda` | `cuda` 또는 `cpu` |
 | `STT_COMPUTE` | `float16` | CPU 면 `int8` |
-| `STT_WORKER_TOKEN` | (빈 값) | ★백엔드와 나눠 갖는 열쇠. **빈 값이면 인증을 안 한다** |
+| `STT_WORKER_TOKEN` | (빈 값) | ★백엔드와 나눠 갖는 열쇠 |
+| `STT_ALLOW_NO_AUTH` | `false` | ★토큰 없이 띄우는 것을 **일부러** 허용 (로컬 전용) |
 
 ⚠️`STT_WORKER_TOKEN` 이 비면 **누구나 이 워커를 쓸 수 있다.** 막히는 게 아니라 **열린다.**
+
+★**그래서 빈 토큰이면 기동에서 죽는다.** 2026-08-10 에 실제로 당한 것을 막는 빗장이다 —
+ConfigMap 에서 `SECRETS_BACKEND` 가 빠진 채 배포돼 토큰이 안 들어왔는데, 파드는 멀쩡히
+`Running` 이고 `/health` 도 200 이라 **아무 데도 안 보인 채 인증만 꺼져 있었다.**
+로컬에서 토큰 없이 띄우려면 `STT_ALLOW_NO_AUTH=true` 를 **일부러** 줘야 한다.
 
 ★클러스터에서는 이 값을 **금고(Secrets Manager)에서 직접 읽는다.** `catchap-stt-worker-token`
 하나뿐이고, 백엔드도 **같은 시크릿**을 읽어 헤더에 실어 보낸다. 그래서 회전할 때
