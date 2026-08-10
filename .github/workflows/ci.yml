@@ -37,7 +37,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           # ★requirements.txt 를 안 쓴다 — faster-whisper 는 GPU 용이라 여기서 필요 없다
-          pip install fastapi==0.115.6 python-multipart==0.0.20 httpx
+          pip install fastapi==0.115.6 python-multipart==0.0.20 httpx uvicorn==0.34.0
 
       - name: HTTP 계층 확인
         env:
@@ -104,6 +104,96 @@ jobs:
                   "  _TOKEN = os.environ.get(...) 줄 ★앞으로 옮기십시오.\n"
                   "  받은 값: %s" % got)
           print("  _TOKEN =", got, "→ 로더가 ★먼저 돌았습니다")
+          PY
+
+      - name: ★★전사 중에도 /health 가 대답하는지 (살아있음 검사에 안 죽는지)
+        env:
+          PYTHONIOENCODING: utf-8
+        run: |
+          # ★★왜 이 시험이 있나 — 2026-08-10 ★실제 장애.
+          #
+          #   transcribe 를 `async def` 로 두고 그 안에서 faster-whisper 의 ★블로킹 호출을
+          #   했더니 ★이벤트 루프가 멈췄다. 전사하는 동안 /health 가 응답을 못 했고,
+          #   쿠버네티스 살아있음 검사(30초×3=90초)가 ★전사 중인 파드를 죽였다.
+          #   강의 하나를 실제로 올렸다가 exitCode 137 로 죽고 실패 메일이 나갔다.
+          #
+          #   ⚠️짧은 표본(16~40초)으로만 시험해서 90초를 못 넘겨 ★안 드러났다.
+          #     그래서 이 시험은 ★시간이 아니라 「전사 중에 /health 가 사나」를 본다.
+          python - <<'PY'
+          import io, os, shutil, subprocess, sys, tempfile, threading, time, urllib.request
+
+          d = tempfile.mkdtemp()
+          shutil.copy("main.py", d)
+          io.open(os.path.join(d, "secrets_loader.py"), "w", encoding="utf-8").write(
+              "def load_secrets_into_env(environ=None):\n    return None\n")
+
+          # ★faster_whisper 를 ★느린 가짜로 바꾼다 (GPU 없이 블로킹만 흉내)
+          fw = os.path.join(d, "faster_whisper")
+          os.makedirs(fw)
+          io.open(os.path.join(fw, "__init__.py"), "w", encoding="utf-8").write(
+              "import time\n"
+              "class _Seg:\n"
+              "    def __init__(s): s.start=0.0; s.end=1.0; s.text='ok'\n"
+              "class _Info:\n"
+              "    duration=1.0; language='ko'\n"
+              "class WhisperModel:\n"
+              "    def __init__(self, *a, **k): pass\n"
+              "    def transcribe(self, path, **k):\n"
+              "        time.sleep(6)          # ★블로킹 — 진짜 전사를 흉내 낸다\n"
+              "        return [_Seg()], _Info()\n")
+
+          env = dict(os.environ)
+          env.update({"STT_WORKER_TOKEN": "t" * 8, "STT_DEVICE": "cpu",
+                      "STT_MODEL": "tiny", "PYTHONPATH": d})
+          srv = subprocess.Popen([sys.executable, "-m", "uvicorn", "main:app",
+                                  "--host", "127.0.0.1", "--port", "8199"],
+                                 cwd=d, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+          try:
+              for _ in range(60):                      # 뜰 때까지
+                  try:
+                      urllib.request.urlopen("http://127.0.0.1:8199/health", timeout=1); break
+                  except Exception: time.sleep(0.5)
+              else:
+                  raise SystemExit("  ★서버가 안 떴습니다")
+
+              done = {}
+              def do_transcribe():
+                  b = "bnd"
+                  body = (("--%s\r\nContent-Disposition: form-data; name=\"file\"; "
+                           "filename=\"a.wav\"\r\n\r\n" % b).encode() + b"x"
+                          + ("\r\n--%s--\r\n" % b).encode())
+                  r = urllib.request.urlopen(urllib.request.Request(
+                      "http://127.0.0.1:8199/transcribe", data=body,
+                      headers={"Content-Type": "multipart/form-data; boundary=%s" % b,
+                               "X-Worker-Token": "t" * 8}), timeout=60)
+                  done["status"] = r.status
+
+              th = threading.Thread(target=do_transcribe); th.start()
+              time.sleep(1.5)                          # 전사가 도는 중
+
+              ok = slow = 0
+              t0 = time.time()
+              while time.time() - t0 < 4:              # ★전사 도는 동안 계속 두드린다
+                  s = time.time()
+                  try:
+                      urllib.request.urlopen("http://127.0.0.1:8199/health", timeout=5)
+                      ok += 1
+                      if time.time() - s > 1: slow += 1
+                  except Exception as e:
+                      raise SystemExit(
+                          "  ★전사 중에 /health 가 죽었습니다 (%s).\n"
+                          "    → transcribe 가 이벤트 루프를 막고 있습니다.\n"
+                          "    → main.py 의 `async def transcribe` 를 ★`def` 로 바꾸십시오."
+                          % type(e).__name__)
+                  time.sleep(0.2)
+              th.join(timeout=60)
+              print("  전사 중 /health 성공 %d회 (느린 응답 %d회) · 전사 결과 %s"
+                    % (ok, slow, done.get("status")))
+              assert done.get("status") == 200, done
+              assert slow == 0, "  ★/health 가 느려졌습니다 — 루프가 눌리고 있습니다"
+              print("  ★전사 중에도 /health 가 즉시 대답합니다 — 살아있음 검사에 안 죽습니다")
+          finally:
+              srv.terminate()
           PY
 
       - name: ★토큰이 비면 기동에서 죽는지
