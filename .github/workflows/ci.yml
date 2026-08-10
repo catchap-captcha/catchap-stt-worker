@@ -67,3 +67,41 @@ jobs:
           assert r.status_code == 401, (r.status_code, r.text[:200])
           print("  /transcribe    401 (헤더 없음)")
           PY
+
+      - name: ★금고 로더가 _TOKEN 보다 먼저 도는지
+        env:
+          PYTHONIOENCODING: utf-8
+        run: |
+          # ★왜 이 시험이 있나 — main.py 는 모듈을 부르는 ★그 순간 _TOKEN 을 읽어 굳힌다.
+          #   로더 호출이 그 줄 뒤로 밀리면 _TOKEN 이 ★빈 값이 되고, 빈 값이면 인증을
+          #   통째로 건너뛴다. ★막히는 게 아니라 ★열리기 때문에 아무도 못 알아챈다.
+          #
+          # ★어떻게 확인하나 — 진짜 금고를 부르지 않는다. secrets_loader 를 ★가짜로 바꿔
+          #   「로더가 넣어 준 값」을 흉내 내고, main._TOKEN 이 그 값을 들고 있는지 본다.
+          #   순서가 맞으면 'from-vault' 가 나오고, 뒤집히면 빈 문자열이 나온다.
+          python - <<'PY'
+          import os, shutil, subprocess, sys, tempfile
+
+          d = tempfile.mkdtemp()
+          shutil.copy("main.py", d)
+          with open(os.path.join(d, "secrets_loader.py"), "w", encoding="utf-8") as f:
+              f.write("import os\n"
+                      "def load_secrets_into_env(environ=None):\n"
+                      "    os.environ['STT_WORKER_TOKEN'] = 'from-vault'\n")
+
+          env = dict(os.environ)
+          env.pop("STT_WORKER_TOKEN", None)     # ★환경에는 없다 — 로더만이 넣을 수 있다
+          env["PYTHONPATH"] = d
+
+          out = subprocess.run(
+              [sys.executable, "-c", "import main; print(repr(main._TOKEN))"],
+              cwd=d, env=env, capture_output=True, text=True)
+          got = out.stdout.strip()
+          if got != repr("from-vault"):
+              print("STDOUT:", out.stdout); print("STDERR:", out.stderr[-1500:])
+              raise SystemExit(
+                  "★로더가 _TOKEN 보다 늦게 돕니다. main.py 에서 load_secrets_into_env() 를\n"
+                  "  _TOKEN = os.environ.get(...) 줄 ★앞으로 옮기십시오.\n"
+                  "  받은 값: %s" % got)
+          print("  _TOKEN =", got, "→ 로더가 ★먼저 돌았습니다")
+          PY

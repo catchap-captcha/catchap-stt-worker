@@ -19,6 +19,22 @@ import tempfile
 
 from fastapi import FastAPI, File, Header, HTTPException, UploadFile
 
+from secrets_loader import load_secrets_into_env
+
+# ★★아래 os.environ.get 들보다 ★먼저 금고를 읽어 os.environ 에 넣는다. 자리가 중요하다.
+#
+#   이 파일은 모듈을 불러오는 ★그 순간 환경변수를 읽어 상수에 담는다. 로더가 그 뒤에
+#   돌면 _TOKEN 은 이미 빈 문자열로 굳어 있고, 빈 값이면 아래 transcribe 가 인증을
+#   ★통째로 건너뛴다 — 클러스터 안의 아무 파드나 이 워커로 GPU 를 쓸 수 있게 된다.
+#   ★막히는 게 아니라 ★열린다. 그래서 조용히 지나간다.
+#
+#   ⚠️캡차에서 같은 함정을 겪었다(0810) — dataclass 기본값이 class 문 시점에 평가돼서,
+#     로더를 settings = Settings() 앞에 두었더니 여전히 옛 값을 읽고 있었다.
+#
+#   ★이 순서가 뒤집히지 않는지는 CI 가 실제로 확인한다(.github/workflows/ci.yml).
+#   ★SECRETS_BACKEND 가 없으면 로더는 아무것도 안 한다 — 로컬·CI 는 그대로 돈다.
+load_secrets_into_env()
+
 # 모델·디바이스는 환경변수로 — GPU(T4)면 large-v3/float16, 없으면 CPU(int8) 폴백 가능.
 _MODEL_SIZE = os.environ.get("STT_MODEL", "large-v3")
 _DEVICE = os.environ.get("STT_DEVICE", "cuda")
