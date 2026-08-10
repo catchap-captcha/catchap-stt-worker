@@ -31,11 +31,18 @@ API(유료·25MB 한계·오디오 외부 전송)를 대체 — Tesla T4 GPU에�
 
 ```
 namespace   catchap
-Deployment  stt-worker      GPU 1개를 요청한다(nvidia.com/gpu: 1)
+Deployment  stt-worker      GPU 1개를 요청한다(nvidia.com/gpu: 1) · ★replicas 1
 Service     stt-worker:8100 클러스터 안에서만 보인다(ClusterIP)
-PVC         stt-model-cache 모델 캐시 2.9GB
 매니페스트   catchap-infra  k8s/stt-worker/
 ```
+
+★**디스크(PVC)가 없다 — 이 앱도 완전 무상태다.**
+모델 3.09GB 는 **이미지에 구워** 두었고 판(revision)도 못 박았다. 그래서
+런타임에 HuggingFace 를 **아예 안 부른다.**
+
+⚠️전에는 PVC 에 캐시로 두었는데, 그 디스크가 **가용영역에 묶여** GPU 노드풀을
+다른 AZ 에 다시 만들면 **파드가 영영 `Pending`** 이 되는 함정이 있었다.
+자세한 근거는 `Dockerfile` 의 모델 굽는 부분 주석.
 
 ★**GPU 노드를 어떻게 찾아가나** — `nodeSelector` 로 고르지 않는다.
 `nvidia.com/gpu: 1` 을 요청하면 **그 자원을 가진 노드는 하나뿐**이라 스케줄러가 알아서 보낸다.
@@ -76,7 +83,7 @@ curl -s localhost:8100/health
 
 | 이름 | 기본값 | 뜻 |
 |---|---|---|
-| `STT_MODEL` | `large-v3` | 모델 크기 |
+| `STT_MODEL` | `/opt/whisper-model` | ★이미지에 구워 둔 모델 경로 (이름 대신 경로) |
 | `STT_DEVICE` | `cuda` | `cuda` 또는 `cpu` |
 | `STT_COMPUTE` | `float16` | CPU 면 `int8` |
 | `STT_WORKER_TOKEN` | (빈 값) | ★백엔드와 나눠 갖는 열쇠 |
