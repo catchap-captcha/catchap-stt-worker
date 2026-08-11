@@ -42,7 +42,9 @@ from __future__ import annotations
 import json
 import logging
 import os
+import random
 import re
+import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
@@ -111,22 +113,74 @@ class LoadResult:
         return "\n".join(parts)
 
 
+# ── ★429 재시도 (2026-08-11 신설)
+#
+# 왜 — 0811 에 행동AI·캡차·백엔드를 잇달아 재시작했더니 금고 API 가 ★429(요청이
+#   너무 잦음)를 줬다. 그때는 uvicorn 이 워커를 다시 띄워 ★우연히 회복했다.
+#   하지만 ★노드 한 대가 죽어 파드가 한꺼번에 뜨면 기동이 통째로 실패한다.
+#   기다렸다 다시 묻는 것 말고 방법이 없다.
+#
+# ⚠️★기동 예산 안에서만 기다린다. 로더는 앱이 뜨기 ★전에 도는 코드라
+#   여기서 오래 끌면 startupProbe 가 파드를 죽인다(백엔드는 ★최대 90초다).
+#   그래서 ★요청마다가 아니라 ★기동 한 번당 총 재시도 시간을 묶는다.
+#   예산을 다 쓰면 ★기다리지 않고 바로 실패한다 — 더 끌면 원인이 안 보인다.
+#   실측: 로더 전체가 정상일 때 ★1.2~1.7초. 예산 20초를 더해도 여유가 크다.
+_RETRY_STATUS = frozenset({429, 500, 502, 503, 504})
+_RETRY_BUDGET_SEC = 20.0     # 기동 한 번이 재시도에 쓸 수 있는 총합
+_RETRY_BASE_SEC = 0.4        # 0.4 → 0.8 → 1.6 → 3.2 …
+_RETRY_MAX_SLEEP = 5.0
+_retry_left = 0.0            # load_secrets_into_env() 가 예산을 채운다
+
+
+def _retry_wait(attempt: int, retry_after: str | None) -> float:
+    """다음 시도까지 기다릴 시간. ★서버가 Retry-After 를 주면 그것을 따른다."""
+    if retry_after:
+        try:
+            return min(max(float(retry_after), 0.0), _RETRY_MAX_SLEEP)
+        except ValueError:
+            pass
+    # ★지터를 넣는다 — 파드가 한꺼번에 뜨면 재시도도 같은 순간에 몰려
+    #   429 가 그대로 되풀이된다.
+    base = min(_RETRY_BASE_SEC * (2 ** attempt), _RETRY_MAX_SLEEP)
+    return base * (1.0 + random.random() * 0.5)
+
+
 def _http(url: str, *, method: str = "GET", body: dict | None = None,
           headers: dict | None = None):
-    req = urllib.request.Request(
-        url, method=method,
-        data=json.dumps(body).encode("utf-8") if body is not None else None,
-        headers=headers or {},
-    )
-    if body is not None:
-        req.add_header("Content-Type", "application/json")
-    try:
-        return urllib.request.urlopen(req, timeout=_TIMEOUT)
-    except urllib.error.HTTPError as e:
-        # ★본문을 그대로 넣지 않는다 — 오류 응답에 값이 섞여 로그로 샐 수 있다.
-        raise SecretsLoadError(f"{method} {url.split('?')[0]} → HTTP {e.code}") from None
-    except urllib.error.URLError as e:
-        raise SecretsLoadError(f"{method} {url.split('?')[0]} → 연결 실패 ({e.reason})") from None
+    global _retry_left
+    safe = url.split("?")[0]
+    attempt = 0
+    while True:
+        req = urllib.request.Request(
+            url, method=method,
+            data=json.dumps(body).encode("utf-8") if body is not None else None,
+            headers=headers or {},
+        )
+        if body is not None:
+            req.add_header("Content-Type", "application/json")
+        try:
+            return urllib.request.urlopen(req, timeout=_TIMEOUT)
+        except urllib.error.HTTPError as e:
+            # ★본문을 그대로 넣지 않는다 — 오류 응답에 값이 섞여 로그로 샐 수 있다.
+            retryable = e.code in _RETRY_STATUS
+            after = e.headers.get("Retry-After") if e.headers else None
+            failure = SecretsLoadError(f"{method} {safe} → HTTP {e.code}")
+        except urllib.error.URLError as e:
+            # 연결 자체가 안 된 경우 — 네트워크가 늦는 중일 수 있어 다시 시도한다.
+            retryable = True
+            after = None
+            failure = SecretsLoadError(f"{method} {safe} → 연결 실패 ({e.reason})")
+
+        wait = _retry_wait(attempt, after)
+        if not retryable or wait > _retry_left:
+            raise failure from None
+        _retry_left -= wait
+        attempt += 1
+        logger.warning(
+            "[SECRETS] %s %s 실패 — %.1f초 뒤 다시 시도 (남은 재시도 예산 %.1f초)",
+            method, safe, wait, _retry_left,
+        )
+        time.sleep(wait)
 
 
 def _token(iam_endpoint: str, access_key: str, secret_key: str) -> str:
@@ -224,6 +278,11 @@ def load_secrets_into_env(environ: dict | None = None) -> LoadResult:
         raise SecretsLoadError(
             f"SECRETS_BACKEND 값이 올바르지 않습니다: {backend!r} (none | kakaocloud)"
         )
+
+    # ★재시도 예산을 기동마다 다시 채운다. ★전역이라 여기서 초기화하지 않으면
+    #   한 번 쓴 예산이 다음 호출에 그대로 남는다.
+    global _retry_left
+    _retry_left = _RETRY_BUDGET_SEC
 
     access_key = (env.get("SECRETS_ACCESS_KEY") or "").strip()
     secret_key = (env.get("SECRETS_SECRET_KEY") or "").strip()
