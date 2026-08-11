@@ -16,9 +16,17 @@ name: CI
 #   main.py 가 faster_whisper 를 ★함수 안에서 import 하도록 짜여 있어서
 #   HTTP 계층만 따로 시험할 수 있다. 그 설계 덕분에 이 CI 가 10초에 끝난다.
 
+# ★언제 도는가 — ★PR 과 main 뿐이다 (2026-08-11 변경).
+#   그전에는 `branches: ['**']` 이라 ★모든 브랜치의 모든 푸시에서 돌았고,
+#   PR 작업 중에는 커밋 하나가 ★두 번 검사됐다 — PR 화면에
+#   `CI / test (push)` 와 `CI / test (pull_request)` 가 나란히 떴다.
+#   Free 플랜 + 비공개 저장소라 Actions 분(分)이 ★유료 계량 대상이다.
+#
+# ⚠️main 을 남기는 이유 — 브랜치 보호를 못 걸어(Free 플랜) ★main 직접 push 가
+#   막히지 않는다. 그때도 검사는 돌아야 한다.
 on:
   push:
-    branches: ['**']
+    branches: [main]
   pull_request:
 
 jobs:
