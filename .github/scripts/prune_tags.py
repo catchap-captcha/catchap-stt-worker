@@ -1,29 +1,32 @@
 #!/usr/bin/env python3
-"""오래된 이미지 태그를 정리한다 — 최근 N개만 남긴다.
+"""이미지 태그가 너무 쌓이면 ★알려 준다. (지우지는 못한다)
 
-★왜 만들었나
-  배포할 때마다 커밋 해시로 태그가 쌓이는데 지우는 곳이 없었다.
-  2026-08-12 에 손으로 정리해 보니 프론트엔드만 57개였다.
+★왜 「지우기」가 아니라 「알리기」인가 — 2026-08-12 에 확인했다.
 
-★2026-08-12 사고에서 배운 것 (이 스크립트가 그걸 막는다)
-  손으로 정리할 때 "지금 쓰는 태그"를 한 번 재고 30분 뒤에 그 목록으로 지웠다.
-  그 사이 배포가 두 번 돌아 ★쓰는 태그가 바뀌었고, 그걸 지워서 프론트가 깨졌다.
-  → 이 스크립트는 ★고정 목록을 쓰지 않는다. 매번 지금 목록을 읽어
-    ★날짜순 최근 N개를 남긴다. 배포가 동시에 돌아도 최근 것은 안 지운다.
+  처음에는 자동으로 지우려고 만들었다. 그런데 실제로 돌려 보니 전부 401 이었다.
 
-★안전장치
-  · KEEP 개수만큼 최근 것을 남긴다 (기본 10)
-  · 방금 올린 태그는 무조건 남긴다
-  · buildcache · latest 처럼 ★해시가 아닌 태그는 건드리지 않는다
-  · 날짜를 못 읽은 태그는 ★후보에서 뺀다 (모르면 안 지운다)
-  · 실패해도 0 으로 끝난다 — ★정리 실패가 배포를 깨뜨리면 안 된다
+      catchap-ops (프로젝트 리더)  → 토큰이 주는 권한: pull
+      catchap-ci  (프로젝트 멤버)  → 토큰이 주는 권한: pull, push
+      ★delete 를 요청해도 안 준다.
 
-⚠️★남은 위험 — KEEP 을 너무 작게 두지 말 것
-  이 스크립트는 "최근 N개"를 남길 뿐, 클러스터가 지금 무엇을 쓰는지는 모른다.
-  배포가 실패해 클러스터가 옛 태그에 머물러 있는데 그 뒤로 N개가 더 올라가면,
-  ★쓰는 태그가 밀려나 지워질 수 있다.
-  · 배포 직후에 도는 한 방금 올린 것이 최신이라 실제로는 안전하다
-  · 그래도 KEEP 은 ★10 이상을 권한다. 태그 하나는 몇 KB 다 — 아낄 이유가 없다
+  공식 문서도 같은 말을 한다.
+      · 이미지·태그 삭제는 ★콘솔로만 (API·CLI 방법이 문서에 없다)
+        https://docs.kakaocloud.com/en/service/container-pack/cr/how-to-guides/cr-manage-image
+      · Container Registry 는 ★OpenAPI 목록에 아예 없다
+        https://docs.kakaocloud.com/en/openapi
+      · 자동 정리·보존정책 기능도 ★없다
+      · 「만료기한」은 정리가 아니라 ★그날부터 Push·Pull 을 막는 스위치다
+
+  ★IAM 역할 25개에 Container Registry 역할이 아예 없어서, 권한을 더 줄 방법도 없다.
+
+  → 그래서 이 스크립트는 ★세어서 알리기만 한다. 지우는 것은 사람이 콘솔에서 한다.
+
+★왜 그래도 만드나 — 안 세면 아무도 모른다.
+  0812 에 손으로 세어 보니 프론트엔드만 57개, 다섯 이미지 합쳐 130개 남짓이었다.
+  쌓이는 것을 아무도 몰랐던 것이 문제였다.
+
+★나중에 카카오가 삭제 API 를 열면 TRY_DELETE=1 로 켜면 된다.
+  그 경로도 남겨 두었다 — 다만 ★기본은 꺼져 있다.
 """
 import base64
 import json
@@ -40,7 +43,7 @@ ACCEPT = ",".join([
     "application/vnd.docker.distribution.manifest.list.v2+json",
     "application/vnd.docker.distribution.manifest.v2+json",
 ])
-# ★해시 태그만 정리 대상. buildcache·latest 등은 이름 모양으로 걸러진다.
+# ★해시 태그만 센다. buildcache·latest 등은 이름 모양으로 걸러진다.
 HASH_TAG = re.compile(r"^[0-9a-f]{7,40}$")
 
 
@@ -56,7 +59,7 @@ def http(url, method="GET", headers=None, timeout=30):
 
 
 def token_for(host, repo, user, password, actions="pull,delete"):
-    st, hd, _ = http("https://%s/v2/" % host)
+    _, hd, _ = http("https://%s/v2/" % host)
     chal = hd.get("Www-Authenticate") or hd.get("WWW-Authenticate") or ""
     m = re.search(r'realm="([^"]+)"', chal)
     s = re.search(r'service="([^"]+)"', chal)
@@ -75,38 +78,15 @@ def token_for(host, repo, user, password, actions="pull,delete"):
         return None
 
 
-def created_at(host, repo, tag, H):
-    """이미지가 언제 만들어졌는지. 못 읽으면 None (그러면 안 지운다)."""
-    st, hd, body = http("https://%s/v2/%s/manifests/%s" % (host, repo, tag),
-                        headers=dict(H, Accept=ACCEPT))
-    if st != 200:
-        return None, None
-    digest = hd.get("Docker-Content-Digest")
-    try:
-        man = json.loads(body)
-    except Exception:  # noqa: BLE001
-        return None, digest
-    # 목록(index)이면 첫 항목을 따라간다
-    if "manifests" in man and man["manifests"]:
-        sub = man["manifests"][0].get("digest")
-        st, hd2, body = http("https://%s/v2/%s/manifests/%s" % (host, repo, sub),
-                             headers=dict(H, Accept=ACCEPT))
-        if st != 200:
-            return None, digest
+def notice(kind, title, line):
+    print("::%s title=%s::%s" % (kind, title, line))
+    path = os.environ.get("GITHUB_STEP_SUMMARY")
+    if path:
         try:
-            man = json.loads(body)
+            with open(path, "a", encoding="utf-8") as f:
+                f.write("\n### %s\n\n%s\n" % (title, line))
         except Exception:  # noqa: BLE001
-            return None, digest
-    cfg = (man.get("config") or {}).get("digest")
-    if not cfg:
-        return None, digest
-    st, _, blob = http("https://%s/v2/%s/blobs/%s" % (host, repo, cfg), headers=H)
-    if st != 200:
-        return None, digest
-    try:
-        return json.loads(blob).get("created"), digest
-    except Exception:  # noqa: BLE001
-        return None, digest
+            pass
 
 
 def main():
@@ -114,65 +94,53 @@ def main():
     repo = os.environ.get("IMAGE_PATH", "")
     user = os.environ.get("REGISTRY_USERNAME", "")
     pw = os.environ.get("REGISTRY_PASSWORD", "")
-    keep_n = int(os.environ.get("KEEP_TAGS", "10"))
-    just_pushed = os.environ.get("PUSHED_TAG", "").strip()
+    limit = int(os.environ.get("TAG_LIMIT", "20"))
+    try_delete = os.environ.get("TRY_DELETE", "").lower() in ("1", "true", "yes")
 
     if not (host and repo and user and pw):
-        print("  설정이 모자라 정리를 건너뜁니다.")
+        print("  설정이 모자라 점검을 건너뜁니다.")
         return 0
 
-    H0 = token_for(host, repo, user, pw)
-    if not H0:
-        print("  토큰을 못 받아 정리를 건너뜁니다.")
+    tok = token_for(host, repo, user, pw)
+    if not tok:
+        print("  토큰을 못 받아 점검을 건너뜁니다.")
         return 0
-    H = {"Authorization": "Bearer " + H0}
+    H = {"Authorization": "Bearer " + tok}
 
     st, _, body = http("https://%s/v2/%s/tags/list" % (host, repo), headers=H)
     if st != 200:
-        print("  태그 목록을 못 읽어 정리를 건너뜁니다 (HTTP %s)." % st)
+        print("  태그 목록을 못 읽었습니다 (HTTP %s)." % st)
         return 0
-    tags = (json.loads(body).get("tags") or [])
-    print("  태그 %d개" % len(tags))
+    tags = json.loads(body).get("tags") or []
+    hashy = [t for t in tags if HASH_TAG.match(t)]
+    other = sorted(set(tags) - set(hashy))
+    print("  태그 %d개 (해시 %d · 그 외 %d)" % (len(tags), len(hashy), len(other)))
+    if other:
+        print("  세지 않는 것: %s" % ", ".join(other))
 
-    # ★해시 모양이 아닌 것(buildcache·latest 등)은 아예 후보에서 뺀다
-    cand = [t for t in tags if HASH_TAG.match(t) and t != just_pushed]
-    skipped = [t for t in tags if t not in cand]
-    if skipped:
-        print("  건드리지 않음: %s" % ", ".join(sorted(skipped)))
-    if len(cand) <= keep_n:
-        print("  정리 대상 %d개 ≤ 남길 개수 %d — 할 일 없음." % (len(cand), keep_n))
-        return 0
-
-    dated = []
-    for t in cand:
-        c, dg = created_at(host, repo, t, H)
-        if c and dg:
-            dated.append((c, t, dg))
-    if len(dated) <= keep_n:
-        print("  날짜를 읽은 것이 %d개뿐이라 정리하지 않습니다." % len(dated))
+    if len(hashy) <= limit:
+        print("  %d개 ≤ 기준 %d — 아직 괜찮습니다." % (len(hashy), limit))
         return 0
 
-    dated.sort(reverse=True)                      # 최근 것이 앞
-    keep = dated[:keep_n]
-    drop = dated[keep_n:]
-    print("  남김 %d개 (최근순) · 지움 %d개" % (len(keep), len(drop)))
+    line = ("**%s** 의 태그가 **%d개** 입니다 (기준 %d).\n\n"
+            "카카오클라우드 Container Registry 는 **API 로 태그를 지울 수 없습니다** "
+            "— 콘솔에서만 됩니다.\n\n"
+            "```\n콘솔 → Container Registry → %s → 이미지 → 태그 탭\n"
+            "     → 오래된 것 선택 → [태그 삭제] → \"영구 삭제\" 입력\n```\n\n"
+            "⚠️**`buildcache` 는 지우지 마십시오** — 없으면 빌드가 매번 처음부터 돕니다.\n"
+            "⚠️**지우기 직전에 클러스터가 쓰는 태그를 다시 확인**하십시오. "
+            "0812 에 30분 전 목록으로 지웠다가 프론트엔드가 깨졌습니다."
+            % (repo, len(hashy), limit, repo.split("/")[0]))
+    notice("warning", "이미지 태그 정리가 필요합니다", line)
 
-    dry = os.environ.get("DRY_RUN", "").lower() in ("1", "true", "yes")
-    if dry:
-        print("  ★시험 모드 — 실제로 지우지 않습니다.")
-        for c, t, _ in drop:
-            print("    (지울 것) %s  %s" % (t, c[:19]))
+    if not try_delete:
         return 0
 
-    ok = 0
-    for c, t, dg in drop:
-        st, _, b = http("https://%s/v2/%s/manifests/%s" % (host, repo, dg), "DELETE", H)
-        if st in (200, 202):
-            ok += 1
-            print("    지움 %s (%s)" % (t, c[:10]))
-        else:
-            print("    ★못 지움 %s → HTTP %s %s" % (t, st, b.decode("utf-8", "replace")[:80]))
-    print("  정리 끝 — %d/%d" % (ok, len(drop)))
+    # ── 아래는 ★카카오가 삭제 API 를 열면 쓸 경로. 기본은 꺼져 있다.
+    print("  TRY_DELETE 가 켜져 있어 삭제를 시도합니다.")
+    st, _, b = http("https://%s/v2/%s/manifests/%s" % (host, repo, hashy[-1]), "HEAD",
+                    dict(H, Accept=ACCEPT))
+    print("    (시험) HEAD %s → HTTP %s" % (hashy[-1], st))
     return 0
 
 
@@ -180,6 +148,6 @@ if __name__ == "__main__":
     try:
         sys.exit(main())
     except Exception as e:  # noqa: BLE001
-        # ★정리가 실패해도 배포는 성공이어야 한다
-        print("  정리 중 오류 (배포에는 영향 없음): %s" % e.__class__.__name__)
+        # ★점검이 실패해도 배포는 성공이어야 한다
+        print("  점검 중 오류 (배포에는 영향 없음): %s" % e.__class__.__name__)
         sys.exit(0)

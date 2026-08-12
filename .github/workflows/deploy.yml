@@ -233,7 +233,14 @@ jobs:
       #       ★날짜순 최근 10개를 남긴다. buildcache 같은 비해시 태그는 안 건드린다.
       #
       #   ★continue-on-error — 정리가 실패해도 배포는 성공이어야 한다.
-      - name: 오래된 이미지 태그 정리 (최근 10개만 남김)
+      - name: 이미지 태그가 쌓였는지 점검 (알림만)
+        if: steps.gate.outputs.ready == 'true'
+        continue-on-error: true
+        env:
+          REGISTRY_USERNAME: ${{ secrets.REGISTRY_USERNAME }}
+          REGISTRY_PASSWORD: ${{ secrets.REGISTRY_PASSWORD }}
+          TAG_LIMIT: "20"
+        run: python3 .github/scripts/prune_tags.py
         if: steps.gate.outputs.ready == 'true'
         continue-on-error: true
         env:
