@@ -241,14 +241,6 @@ jobs:
           REGISTRY_PASSWORD: ${{ secrets.REGISTRY_PASSWORD }}
           TAG_LIMIT: "20"
         run: python3 .github/scripts/prune_tags.py
-        if: steps.gate.outputs.ready == 'true'
-        continue-on-error: true
-        env:
-          REGISTRY_USERNAME: ${{ secrets.REGISTRY_USERNAME }}
-          REGISTRY_PASSWORD: ${{ secrets.REGISTRY_PASSWORD }}
-          PUSHED_TAG: ${{ steps.tag.outputs.sha }}
-          KEEP_TAGS: "10"
-        run: python3 .github/scripts/prune_tags.py
 
       - name: 뒷정리
         if: always()
