@@ -221,6 +221,28 @@ jobs:
           echo "::error::5번 시도했는데 catchap-infra 에 push 가 안 됩니다"
           exit 1
 
+      # ── ★오래된 이미지 태그 정리 (2026-08-12 추가)
+      #
+      #   왜 — 배포할 때마다 커밋 해시 태그가 쌓이는데 지우는 곳이 없었다.
+      #        0812 에 손으로 세어 보니 프론트엔드만 57개였다.
+      #
+      #   ⚠️★0812 사고 — 손으로 정리하다 ★쓰는 태그를 지워 프론트가 깨졌다.
+      #     "지금 쓰는 태그"를 한 번 재고 30분 뒤에 그 목록으로 지웠는데,
+      #     그 사이 배포가 두 번 돌아 쓰는 태그가 바뀌어 있었다.
+      #     → 그래서 이 단계는 ★고정 목록을 안 쓴다. 매번 지금 목록을 읽어
+      #       ★날짜순 최근 10개를 남긴다. buildcache 같은 비해시 태그는 안 건드린다.
+      #
+      #   ★continue-on-error — 정리가 실패해도 배포는 성공이어야 한다.
+      - name: 오래된 이미지 태그 정리 (최근 10개만 남김)
+        if: steps.gate.outputs.ready == 'true'
+        continue-on-error: true
+        env:
+          REGISTRY_USERNAME: ${{ secrets.REGISTRY_USERNAME }}
+          REGISTRY_PASSWORD: ${{ secrets.REGISTRY_PASSWORD }}
+          PUSHED_TAG: ${{ steps.tag.outputs.sha }}
+          KEEP_TAGS: "10"
+        run: python3 .github/scripts/prune_tags.py
+
       - name: 뒷정리
         if: always()
         run: shred -u ~/.ssh/infra 2>/dev/null || rm -f ~/.ssh/infra
