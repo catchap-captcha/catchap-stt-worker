@@ -16,6 +16,8 @@ nvcc 불필요), VAD(voice activity detection — 무음 구간 건너뛰어 속
 """
 import os
 import tempfile
+import threading
+import time
 
 from fastapi import FastAPI, File, Header, HTTPException, UploadFile
 
@@ -39,6 +41,35 @@ load_secrets_into_env()
 _MODEL_SIZE = os.environ.get("STT_MODEL", "large-v3")
 _DEVICE = os.environ.get("STT_DEVICE", "cuda")
 _COMPUTE = os.environ.get("STT_COMPUTE", "float16")
+
+# ★★한 번에 몇 건까지 전사하나 — 기본 1건 (2026-08-19 추가)
+#
+#   ★왜 줄을 세우나 — /transcribe 는 `def` 라 FastAPI 가 ★스레드풀에서 병렬로 돌린다.
+#     강사 두 분이 동시에 올리면 ★같은 GPU 에서 두 전사가 동시에 시작된다. 그러면 —
+#       · GPU 메모리   한 건이 4.3GB / 15.4GB (0819 실측) → 3건이면 한계 근처
+#       · 파드 메모리   파일을 통째로 읽는다. 한도 4Gi 이고 0813 에 실제로 OOM 을 겪었다
+#       · 속도         GPU 사용률이 이미 94% 다(0819 실측). 나눠 써도 ★빨라지지 않는다
+#     결국 동시에 돌려서 얻는 것이 없고 잃는 것만 있다. ★한 건씩 순서대로 한다.
+#
+#   ★기다리게 해도 되는 이유 — 이 호출은 사람이 화면에서 기다리는 것이 아니라
+#     문제 자동 생성 ★작업(job) 안에서 일어난다. 백엔드 시간 제한도 ★1800초(30분)다.
+_MAX_CONCURRENCY = max(1, int(os.environ.get("STT_MAX_CONCURRENCY", "1")))
+
+# ★★줄에 몇 명까지 세우나 — 넘으면 기다리게 하지 않고 ★429 로 돌려보낸다.
+#
+#   ⚠️★이 상한이 없으면 파드가 죽는다. `def` 인 요청은 스레드풀 자리를 하나씩 차지하는데,
+#     그 풀이 다 차면 ★/health 도 자리를 못 얻는다. 살아있음 검사가 3번 실패하면
+#     쿠버네티스가 컨테이너를 죽인다 — 2026-08-10 에 같은 모양으로 실제로 겪었다.
+#     (그때는 `async def` 라 이벤트 루프가 막혔고, 지금은 스레드풀이 막히는 형태다.)
+#
+#   ★그래서 /health 는 아래에서 `async def` 로 바꿔 ★스레드를 아예 안 쓰게 했고,
+#     이 상한으로 스레드풀도 넉넉히 남긴다. 두 겹으로 막는다.
+_QUEUE_MAX = max(0, int(os.environ.get("STT_QUEUE_MAX", "4")))
+
+_slots = threading.BoundedSemaphore(_MAX_CONCURRENCY)
+_waiting = 0                 # 지금 줄에서 기다리는 수
+_running = 0                 # 지금 전사 중인 수
+_counter_lock = threading.Lock()
 # 백엔드만 부르게 하는 공유 토큰. ★빈 값이면 아래 transcribe 가 인증을 통째로 건너뛴다.
 _TOKEN = os.environ.get("STT_WORKER_TOKEN", "")
 
@@ -86,9 +117,36 @@ def _get_model():
 
 
 @app.get("/health")
-def health() -> dict:
-    """기동 확인용 — 모델은 로드하지 않는다(가벼운 헬스체크)."""
-    return {"ok": True, "model": _MODEL_SIZE, "device": _DEVICE, "loaded": _model is not None}
+async def health() -> dict:
+    """기동 확인용 — 모델은 로드하지 않는다(가벼운 헬스체크).
+
+    ★★`async def` 다 (2026-08-19 에 `def` 에서 바꿈). 이유가 있다.
+
+      `def` 면 FastAPI 가 이것도 ★스레드풀에서 돌린다. 전사가 줄을 서서 스레드를
+      점유하면 ★/health 가 자리를 못 얻어 응답이 늦어지고, 살아있음 검사가
+      3번 실패하면 쿠버네티스가 컨테이너를 ★죽인다.
+
+      이 함수는 막히는 일을 전혀 안 하므로 이벤트 루프에서 바로 답해도 된다.
+      그러면 전사가 몇 건이 밀려 있든 ★/health 는 항상 즉시 200 이다.
+
+      ⚠️전사(/transcribe)는 ★반대로 `def` 여야 한다 — 거기는 진짜로 막히는 일이라
+        이벤트 루프에 올리면 루프가 멈춘다(2026-08-10 사고). 둘의 이유가 다르다.
+    """
+    with _counter_lock:
+        waiting, running = _waiting, _running
+    return {
+        "ok": True,
+        "model": _MODEL_SIZE,
+        "device": _DEVICE,
+        "loaded": _model is not None,
+        # ★운영자가 「지금 몇 건이 밀려 있나」를 볼 수 있게 같이 준다.
+        "running": running,
+        "waiting": waiting,
+        "max_concurrency": _MAX_CONCURRENCY,
+        "queue_max": _QUEUE_MAX,
+        # 전체로 받을 수 있는 건수 = 처리 중 + 대기
+        "capacity": _MAX_CONCURRENCY + _QUEUE_MAX,
+    }
 
 
 @app.post("/transcribe")
@@ -125,12 +183,49 @@ def transcribe(
     if _TOKEN and x_worker_token != _TOKEN:
         raise HTTPException(status_code=401, detail="invalid worker token")
 
+    # ★★줄이 너무 길면 ★기다리게 하지 않고 바로 돌려보낸다 (2026-08-19)
+    #
+    #   기다리게만 하면 스레드풀 자리가 계속 쌓여 ★/health 까지 못 뜨게 된다.
+    #   여기서 끊어야 파드가 안 죽는다. 부르는 쪽은 429 를 보고 나중에 다시 오면 된다.
+    #   ★세는 기준은 「전체로 몇 건까지 받나」다 = 처리 중 + 대기.
+    #     0819 에 시험이 잡아 줬다 — 「아직 안 도는 것」만 세면 곧 시작할 한 건도
+    #     대기로 세어 ★한 자리를 손해 본다(동시 3건을 보냈는데 하나가 429).
+    global _waiting, _running
+    capacity = _MAX_CONCURRENCY + _QUEUE_MAX
+    with _counter_lock:
+        if _waiting + _running >= capacity:
+            raise HTTPException(
+                status_code=429,
+                detail=(f"전사 대기열이 가득 찼습니다"
+                        f"(처리 중 {_running}건 · 대기 {_waiting}건 · 상한 {capacity}건). "
+                        "잠시 뒤 다시 시도해 주세요."),
+                headers={"Retry-After": "60"},
+            )
+        _waiting += 1
+
+    # ★파일 받기는 ★줄 서기 ★전에 한다 — 업로드를 먼저 끝내야 부르는 쪽의 연결이
+    #   오래 열려 있지 않고, 파일은 메모리가 아니라 ★디스크에 놓인다.
     suffix = os.path.splitext(file.filename or "")[1] or ".mp4"
     # 임시 파일로 받아 전사(faster-whisper는 파일 경로를 받는다 — mp4/webm 컨테이너 그대로 OK).
-    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
-        tmp.write(file.file.read())     # ★동기 읽기 (이 함수가 def 라서)
-        path = tmp.name
     try:
+        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+            tmp.write(file.file.read())     # ★동기 읽기 (이 함수가 def 라서)
+            path = tmp.name
+    except BaseException:
+        with _counter_lock:
+            _waiting -= 1               # ★받다가 실패해도 대기 수를 되돌린다
+        raise
+
+    # ★한 건씩만 GPU 로 — 나머지는 여기서 순서를 기다린다.
+    waited_from = time.monotonic()
+    _slots.acquire()
+    waited = time.monotonic() - waited_from
+    with _counter_lock:
+        _waiting -= 1
+        _running += 1
+    try:
+        if waited >= 1.0:
+            print(f"INFO:     전사 시작 — 줄에서 {waited:.0f}초 기다림", flush=True)
         segments, info = _get_model().transcribe(path, language=language, vad_filter=True)
         out: list[dict] = []
         for s in segments:  # 제너레이터 — 여기서 실제 전사가 진행된다
@@ -148,6 +243,11 @@ def transcribe(
             "language": info.language,
         }
     finally:
+        # ★자리를 ★반드시 돌려준다 — 여기서 안 놓으면 다음 사람이 영원히 못 들어온다.
+        #   전사가 예외로 끝나든 정상으로 끝나든 이 블록은 지나간다.
+        with _counter_lock:
+            _running -= 1
+        _slots.release()
         try:
             os.unlink(path)
         except OSError:

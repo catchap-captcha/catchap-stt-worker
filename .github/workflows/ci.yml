@@ -76,6 +76,114 @@ jobs:
           print("  /transcribe    401 (헤더 없음)")
           PY
 
+      - name: ★줄 세우기 — 한 번에 한 건 · 밀려도 /health 는 산다
+        env:
+          STT_WORKER_TOKEN: ci-test-token
+          STT_QUEUE_MAX: "2"
+          PYTHONIOENCODING: utf-8
+        run: |
+          # ★왜 이 시험이 있나 (2026-08-19 추가)
+          #   강사 두 분이 동시에 올리면 전에는 ★같은 GPU 에서 두 전사가 동시에 시작됐다.
+          #   GPU 메모리·파드 메모리가 모자라고, 사용률이 이미 94% 라 나눠 써도 안 빨라진다.
+          #   그래서 한 건씩 줄을 세운다. ★여기서 확인하는 것 —
+          #     ① 동시에 와도 ★한 번에 하나만 전사에 들어간다
+          #     ② 줄이 상한을 넘으면 ★429 로 돌려보낸다 (기다리게 하지 않는다)
+          #     ③ ★밀려 있는 동안에도 /health 가 즉시 200 이다 (파드가 안 죽는다)
+          #   ★진짜 모델은 안 쓴다 — _get_model 을 느린 가짜로 바꿔 시간만 흉내 낸다.
+          python - <<'PY'
+          import threading, time
+          from fastapi.testclient import TestClient
+          import main
+
+          peak = [0]; cur = [0]; lk = threading.Lock()
+
+          class FakeModel:
+              def transcribe(self, path, language=None, vad_filter=None):
+                  with lk:
+                      cur[0] += 1
+                      peak[0] = max(peak[0], cur[0])
+                  time.sleep(1.2)                      # 전사가 오래 걸리는 것을 흉내
+                  with lk:
+                      cur[0] -= 1
+                  seg = type("S", (), {"start": 0.0, "end": 1.0, "text": "안녕하세요"})()
+                  info = type("I", (), {"duration": 1.0, "language": "ko"})()
+                  return [seg], info
+
+          main._get_model = lambda: FakeModel()
+          c = TestClient(main.app)
+          H = {"X-Worker-Token": "ci-test-token"}
+          F = {"file": ("a.flac", b"x" * 1024, "audio/flac")}
+
+          codes = []
+          def call():
+              r = c.post("/transcribe", files={"file": ("a.flac", b"x" * 1024, "audio/flac")}, headers=H)
+              codes.append(r.status_code)
+
+          ts = [threading.Thread(target=call) for _ in range(3)]
+          [t.start() for t in ts]
+
+          time.sleep(0.6)                              # 전사가 도는 중에
+          hr = c.get("/health")                        # ★/health 가 즉시 대답해야 한다
+          assert hr.status_code == 200, hr.status_code
+          hb = hr.json()
+          print("  /health 응답 (밀려 있는 중):", hb["running"], "돌고", hb["waiting"], "대기")
+          assert hb["running"] >= 1, hb
+
+          [t.join() for t in ts]
+
+          # ① 동시에 전사에 들어간 최대치가 1 이어야 한다
+          assert peak[0] == 1, f"★동시에 {peak[0]}건이 전사에 들어갔다 — 줄 세우기가 안 된다"
+          print("  동시 전사 최대:", peak[0], "건  ✅")
+
+          # ② 셋 다 200 이어야 한다 — 상한은 ★처리 중 + 대기 = 1 + 2 = 3
+          print("  응답 코드:", sorted(codes))
+          assert sorted(codes) == [200, 200, 200], codes
+
+          # ③ 끝난 뒤 카운터가 0 으로 돌아와야 한다 (자리 반납 확인)
+          hb = c.get("/health").json()
+          assert hb["running"] == 0 and hb["waiting"] == 0, hb
+          print("  끝난 뒤 running/waiting:", hb["running"], hb["waiting"], " ✅")
+          PY
+
+      - name: ★줄이 넘치면 429 로 돌려보낸다
+        env:
+          STT_WORKER_TOKEN: ci-test-token
+          STT_QUEUE_MAX: "1"
+          PYTHONIOENCODING: utf-8
+        run: |
+          python - <<'PY'
+          import threading, time
+          from fastapi.testclient import TestClient
+          import main
+
+          class SlowModel:
+              def transcribe(self, path, language=None, vad_filter=None):
+                  time.sleep(1.5)
+                  seg = type("S", (), {"start": 0.0, "end": 1.0, "text": "가"})()
+                  info = type("I", (), {"duration": 1.0, "language": "ko"})()
+                  return [seg], info
+
+          main._get_model = lambda: SlowModel()
+          c = TestClient(main.app)
+          H = {"X-Worker-Token": "ci-test-token"}
+          codes = []
+          def call():
+              r = c.post("/transcribe", files={"file": ("a.flac", b"x" * 512, "audio/flac")}, headers=H)
+              codes.append(r.status_code)
+
+          ts = [threading.Thread(target=call) for _ in range(4)]
+          [t.start() for t in ts]; [t.join() for t in ts]
+          print("  응답 코드:", sorted(codes))     # 상한 1+1=2 → 200 둘 · 429 둘
+          assert 429 in codes, f"★줄이 넘쳤는데 429 가 없다: {codes}"
+          assert 200 in codes, codes
+          print("  429 로 돌려보낸 수:", codes.count(429), " ✅")
+
+          # ★넘쳐서 돌려보낸 뒤에도 카운터가 0 으로 돌아와야 한다
+          hb = c.get("/health").json()
+          assert hb["running"] == 0 and hb["waiting"] == 0, hb
+          print("  끝난 뒤 running/waiting:", hb["running"], hb["waiting"], " ✅")
+          PY
+
       - name: ★금고 로더가 _TOKEN 보다 먼저 도는지
         env:
           PYTHONIOENCODING: utf-8
